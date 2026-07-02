@@ -1,0 +1,64 @@
+# Publish to PyPI: builds the rexel-client distribution on a tagged GitHub
+# Release and publishes via PyPI OIDC trusted publishing.
+# GitHub-hosted exemption: stays on ubuntu-latest (NOT the self-hosted ci pool)
+# because PyPI OIDC trusted publishing is cleanest/most secure from GitHub-hosted
+# runners with the ambient id-token; the self-hosted pool is not a trusted publisher.
+# Canon: bess-documentation/infrastructure/self-hosted-runner-ci-patterns.md
+name: Publish to PyPI
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install build dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install build
+
+      - name: Build package
+        run: |
+          python -m build
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  publish-pypi:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment:
+      name: pypi
+      url: https://pypi.org/p/rexel-client
+    permissions:
+      id-token: write
+
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
