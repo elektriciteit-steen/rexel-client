@@ -32,13 +32,29 @@ client = RexelClient(
 # Article enrichment (descriptions, brand, images, EAN, packaging) — auto-batched ≤100
 articles = client.article_get(["NIK70036600"])
 
+# …or matched back to what you asked for: {requested_code: Article}, deduplicated
+by_code = client.articles_by_code(["NIK70036600", "E2222407"])
+
 # Live prices + levies + availability for (item_code, quantity) pairs — auto-batched ≤100
 prices = client.price_get([("NIK70036600", 1)])
 
 # Weekly bulk catalog: the agreed customer assortment with net prices + Belgian levies
-items = client.catalog_download()          # -> list[CatalogItem]
-raw_zip = client.catalog_download_raw()     # -> bytes, for archival
+items = client.catalog_download()               # -> list[CatalogItem]
+raw_zip = client.catalog_download_raw()          # -> bytes, for archival
+snapshot = client.catalog_download_snapshot()    # -> raw + sha256 + generated_at + items
 ```
+
+### Unknown codes: the two calls disagree
+
+`article_get` **drops** a code it does not know (the service answers with an inactive,
+empty-code record and the client filters it out), so the list can be shorter than what
+you asked for. `price_get` **returns a row** for one instead. Never infer that an item
+exists from a price row, and never assume either call answers one-to-one with its input.
+
+Rexel also answers `getArticleInformation` once per *requested* code, so two identifiers
+of one product come back twice. `articles_by_code()` resolves each requested code — by
+Rexel ref or e-number, case- and whitespace-insensitively — to a single `Article`. The
+manufacturer reference is not resolvable: the service returns nothing for it.
 
 ### ⚠️ `getBasket` is destructive
 
@@ -58,6 +74,9 @@ before parsing. Structured basket modelling lands in Phase 4.
   `<return>` element (`<Root><Status/><Content/></Root>`); parsing is two-stage.
 - Status codes: `0` OK · `10–13`/`20`/`21` → `RexelAuthError` · `-1`/`30`/`99`/other →
   `RexelAPIError` · transport failures → `RexelConnectionError`.
+- The production WSDL is vendored at `tests/fixtures/rexel_prod.wsdl` — it is the
+  authority on the contract (three operations, no more), and a test asserts the
+  hand-rolled envelopes still match it.
 
 ## Development
 

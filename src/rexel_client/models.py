@@ -6,7 +6,7 @@ and the ``rexstand`` DBF (see tests/fixtures).
 """
 
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime
 from decimal import Decimal
 
 
@@ -97,3 +97,25 @@ class CatalogItem:
     cable_weight: Decimal  # CABLE_WEIG
     customer_ref: str  # CUST_REF
     erp_code: str  # ERP_NUMB (Rexel e-number)
+
+
+@dataclass
+class CatalogSnapshot:
+    """One ``rexstand`` download, whole: the bytes, their identity, and the rows.
+
+    A refresh decision needs more than the rows — it needs to know *which* download
+    these rows came from. The ZIP is byte-identical between downloads of the same
+    weekly publication, so ``sha256`` is a valid change key: an unchanged digest
+    means nothing new was published.
+
+    ``generated_at`` is the mtime of the ``.dbf`` member inside the ZIP (when Rexel
+    built the export); ``catalog_date`` is the DBF ``DATE`` column, uniform across
+    rows (the assortment's price-validity date). They are different clocks and can
+    legitimately disagree.
+    """
+
+    raw: bytes  # the ZIP verbatim, for archival
+    sha256: str  # hex digest of ``raw`` — the change key
+    generated_at: datetime | None  # ZIP member mtime; None if the entry carries none
+    catalog_date: date | None  # DBF DATE column; None if the rows carry none
+    items: list[CatalogItem]
