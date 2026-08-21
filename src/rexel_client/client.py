@@ -31,6 +31,11 @@ REXSTAND_PATH = "/rs/prod/netstore/downloads/rexstand"
 MAX_BATCH = 100
 
 
+def _canonical(code: str | None) -> str:
+    """The canonical form of an item code — stripped, upper-cased — as sent and matched."""
+    return (code or "").strip().upper()
+
+
 @contextmanager
 def _transport_errors():
     """Map requests transport failures to RexelConnectionError (single source of truth)."""
@@ -149,19 +154,31 @@ class RexelClient:
         ``supplier_item_code``: the manufacturer's own reference is not an identifier
         the service resolves, so asking for one returns nothing at all.
 
+        The tolerance is this client's own: codes go on the wire upper-cased and
+        stripped, so it does not rest on the remote service normalising for us. Codes
+        that are blank once stripped are never sent — they cannot resolve to anything.
+
         Two identifiers of the same product map to the same Article, not to two copies.
+        Conversely, requested codes that differ only in case or surrounding whitespace
+        (``"ABC"`` and ``" abc "``) are asked once and answered twice: each keeps its
+        own key, holding the same Article. Nothing is ever clobbered, because the keys
+        are the caller's strings — only an exactly repeated string collapses, since a
+        dict cannot hold it twice.
         """
+        # One wire code per distinct identifier, in the order first asked for.
+        canonical = [code for code in dict.fromkeys(_canonical(c) for c in item_codes) if code]
+
         # Index by every identifier the articles carry, first reply wins: the duplicate
         # replies for one product are identical, so they collapse onto one Article.
         by_identifier: dict[str, Article] = {}
-        for article in self.article_get(item_codes):
+        for article in self.article_get(canonical):
             for identifier in (article.item_code, article.erp_code):
                 if identifier:
-                    by_identifier.setdefault(identifier.strip().upper(), article)
+                    by_identifier.setdefault(_canonical(identifier), article)
 
         resolved: dict[str, Article] = {}
         for requested in item_codes:
-            article = by_identifier.get((requested or "").strip().upper())
+            article = by_identifier.get(_canonical(requested))
             if article is not None:
                 resolved[requested] = article
         return resolved

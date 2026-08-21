@@ -111,7 +111,9 @@ class CatalogSnapshot:
     ``generated_at`` is the mtime of the ``.dbf`` member inside the ZIP (when Rexel
     built the export); ``catalog_date`` is the DBF ``DATE`` column, uniform across
     rows (the assortment's price-validity date). They are different clocks and can
-    legitimately disagree.
+    legitimately disagree. Uniformity is enforced, not assumed: rows carrying more
+    than one distinct ``DATE`` (blank counting as one of them) are refused with a
+    ``ValueError`` instead of reported as any one of them.
     """
 
     raw: bytes  # the ZIP verbatim, for archival

@@ -54,7 +54,10 @@ exists from a price row, and never assume either call answers one-to-one with it
 Rexel also answers `getArticleInformation` once per *requested* code, so two identifiers
 of one product come back twice. `articles_by_code()` resolves each requested code — by
 Rexel ref or e-number, case- and whitespace-insensitively — to a single `Article`. The
-manufacturer reference is not resolvable: the service returns nothing for it.
+tolerance is the client's own: codes go on the wire stripped and upper-cased, so it does
+not rest on the remote service normalising them. Codes differing only in case or spacing
+are asked once and answered twice — each keeps its own key, holding the same `Article`.
+The manufacturer reference is not resolvable: the service returns nothing for it.
 
 ### ⚠️ `getBasket` is destructive
 
@@ -74,9 +77,13 @@ before parsing. Structured basket modelling lands in Phase 4.
   `<return>` element (`<Root><Status/><Content/></Root>`); parsing is two-stage.
 - Status codes: `0` OK · `10–13`/`20`/`21` → `RexelAuthError` · `-1`/`30`/`99`/other →
   `RexelAPIError` · transport failures → `RexelConnectionError`.
-- The production WSDL is vendored at `tests/fixtures/rexel_prod.wsdl` — it is the
-  authority on the contract (three operations, no more), and a test asserts the
-  hand-rolled envelopes still match it.
+- `CatalogSnapshot.catalog_date` is the *one* date the DBF rows agree on. Rows carrying
+  more than one distinct `DATE` (blank counting as one) raise a `ValueError` rather than
+  report an arbitrary one — it is refresh and archival metadata. A ZIP holding anything
+  other than exactly one `.dbf` member is refused for the same reason.
+- The production WSDL is vendored at `tests/fixtures/rexel_prod.wsdl` — a point-in-time
+  copy of the contract (three operations, no more), with its source and refresh recipe in
+  `tests/fixtures/PROVENANCE.md`. A test asserts the hand-rolled envelopes match it.
 
 ## Development
 
