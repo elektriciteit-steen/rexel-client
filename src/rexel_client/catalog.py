@@ -8,16 +8,17 @@ Numeric DBF fields are parsed to ``Decimal`` (not float) via a custom field pars
 prices and levies keep exact scale.
 """
 
+import hashlib
 import io
 import tempfile
 import zipfile
-from datetime import date
+from datetime import date, datetime
 from decimal import Decimal
 from pathlib import Path
 
 from dbfread import DBF, FieldParser
 
-from .models import CatalogItem
+from .models import CatalogItem, CatalogSnapshot
 
 
 class _DecimalFieldParser(FieldParser):
@@ -97,11 +98,48 @@ def parse_catalog_dbf(dbf_bytes: bytes) -> list[CatalogItem]:
         return [_row_to_item(row) for row in table]
 
 
+def _entry_mtime(info: zipfile.ZipInfo) -> datetime | None:
+    """The ZIP entry's stored mtime, or None when it is not a real date."""
+    try:
+        return datetime(*info.date_time)
+    except ValueError:
+        return None
+
+
+def _dbf_entry(archive: zipfile.ZipFile) -> zipfile.ZipInfo:
+    """The single ``.dbf`` member of a rexstand ZIP."""
+    for info in archive.infolist():
+        if Path(info.filename).suffix.lower() == ".dbf":
+            return info
+    raise ValueError("rexstand ZIP contains no .dbf file")
+
+
 def parse_catalog_zip(zip_bytes: bytes) -> list[CatalogItem]:
-    """Extract the ``.dbf`` from a ``rexstand`` ZIP and parse it into CatalogItem rows."""
+    """Extract the ``.dbf`` from a ``rexstand`` ZIP and parse it into CatalogItem rows.
+
+    Use :func:`parse_catalog_snapshot` when the download's identity (digest,
+    generation stamp) matters too — it answers with all of it in one pass.
+    """
     with zipfile.ZipFile(io.BytesIO(zip_bytes)) as archive:
-        dbf_names = [n for n in archive.namelist() if Path(n).suffix.lower() == ".dbf"]
-        if not dbf_names:
-            raise ValueError("rexstand ZIP contains no .dbf file")
-        dbf_bytes = archive.read(dbf_names[0])
+        dbf_bytes = archive.read(_dbf_entry(archive))
     return parse_catalog_dbf(dbf_bytes)
+
+
+def parse_catalog_snapshot(zip_bytes: bytes) -> CatalogSnapshot:
+    """Parse a ``rexstand`` ZIP into a whole :class:`CatalogSnapshot`.
+
+    The generation stamp lives on the ZIP entry, not in the DBF, so it is only
+    recoverable while the archive is open — reading it afterwards means unzipping
+    the same bytes twice. This does both in one pass.
+    """
+    with zipfile.ZipFile(io.BytesIO(zip_bytes)) as archive:
+        entry = _dbf_entry(archive)
+        generated_at = _entry_mtime(entry)
+        items = parse_catalog_dbf(archive.read(entry))
+    return CatalogSnapshot(
+        raw=zip_bytes,
+        sha256=hashlib.sha256(zip_bytes).hexdigest(),
+        generated_at=generated_at,
+        catalog_date=next((item.catalog_date for item in items if item.catalog_date), None),
+        items=items,
+    )

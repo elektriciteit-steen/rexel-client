@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "rexel-client"
-version = "0.1.0"
+version = "0.2.0"
 description = "Python client for the Rexel Belgium web services (SOAP + rexstand DBF)"
 readme = "README.md"
 license = "MIT"

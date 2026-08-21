@@ -8,7 +8,7 @@ from importlib.metadata import PackageNotFoundError, version
 
 from .client import RexelClient
 from .exceptions import RexelAPIError, RexelAuthError, RexelConnectionError, RexelError
-from .models import Article, CatalogItem, Price
+from .models import Article, CatalogItem, CatalogSnapshot, Price
 
 try:
     # Single source of truth for the version: the installed package metadata.
@@ -22,6 +22,7 @@ __all__ = [
     "Article",
     "Price",
     "CatalogItem",
+    "CatalogSnapshot",
     "RexelError",
     "RexelAPIError",
     "RexelAuthError",

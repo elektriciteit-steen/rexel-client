@@ -2,9 +2,13 @@
 
 Fixtures under ``tests/fixtures`` are real captured responses from the production
 ``rexel`` service (no credentials in them), plus two hand-built error envelopes and a
-3-row DBF sliced from the real weekly catalog.
+3-row DBF sliced from the real weekly catalog. ``rexel_prod.wsdl`` is the production
+WSDL verbatim (public, unauthenticated) and is the authority on the contract.
 """
 
+import hashlib
+import xml.etree.ElementTree as ET
+from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
 
@@ -15,13 +19,15 @@ import responses
 from rexel_client import (
     Article,
     CatalogItem,
+    CatalogSnapshot,
     Price,
     RexelAPIError,
     RexelAuthError,
     RexelClient,
     RexelConnectionError,
+    soap,
 )
-from rexel_client.catalog import parse_catalog_zip
+from rexel_client.catalog import parse_catalog_snapshot, parse_catalog_zip
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 
@@ -110,6 +116,70 @@ class TestArticleGet:
         assert len(responses.calls) == 3  # 150 / 50
 
 
+class TestArticlesByCode:
+    """articles_by_code: replies matched back to the codes that were asked for."""
+
+    @responses.activate
+    def test_two_identifiers_resolve_to_one_article(self, client):
+        # Rexel answers once per requested code, so asking for a Rexel ref and its
+        # e-number returns the same product twice.
+        responses.add(
+            responses.POST,
+            client._soap_url,
+            body=load_fixture("get_article_information_duplicate_response.xml"),
+            status=200,
+            content_type="text/xml",
+        )
+        found = client.articles_by_code(["NIK70036600", "E2222407"])
+        assert set(found) == {"NIK70036600", "E2222407"}
+        assert found["NIK70036600"] is found["E2222407"]
+        assert found["E2222407"].item_code == "NIK70036600"
+
+    @responses.activate
+    def test_match_is_case_and_whitespace_insensitive(self, client):
+        responses.add(
+            responses.POST,
+            client._soap_url,
+            body=load_fixture("get_article_information_response.xml"),
+            status=200,
+            content_type="text/xml",
+        )
+        found = client.articles_by_code(["  nik70036600  "])
+        # Keyed by the requested string verbatim, so the caller can look it back up.
+        assert list(found) == ["  nik70036600  "]
+        assert found["  nik70036600  "].item_code == "NIK70036600"
+
+    @responses.activate
+    def test_unknown_code_is_absent(self, client):
+        responses.add(
+            responses.POST,
+            client._soap_url,
+            body=load_fixture("get_article_information_response.xml"),
+            status=200,
+            content_type="text/xml",
+        )
+        found = client.articles_by_code(["NIK70036600", "ZZZDOESNOTEXIST999"])
+        assert list(found) == ["NIK70036600"]
+
+    @responses.activate
+    def test_supplier_item_code_does_not_match(self, client):
+        # The manufacturer reference is not an identifier the service resolves
+        # (verified live: asking for it returns zero articles), so it must not be
+        # matched here either — that would invent a resolution Rexel does not offer.
+        responses.add(
+            responses.POST,
+            client._soap_url,
+            body=load_fixture("get_article_information_response.xml"),
+            status=200,
+            content_type="text/xml",
+        )
+        assert client.articles_by_code(["700-36600"]) == {}
+
+    def test_empty_input_no_call(self, client):
+        # No HTTP mock registered -> proves no request is made.
+        assert client.articles_by_code([]) == {}
+
+
 class TestPriceGet:
     """price_get / getPrices."""
 
@@ -168,6 +238,38 @@ class TestPriceGet:
         )
         c.price_get([(f"CODE{i}", 1) for i in range(101)])
         assert len(responses.calls) == 3  # 101 -> 50 + 50 + 1
+
+
+class TestUnknownCodeAsymmetry:
+    """article_get drops an unknown code; price_get answers with a row for one.
+
+    Verified live and documented nowhere until 0.2.0. The unknown price row's own
+    field values are hand-built (only its *presence* was verified), so nothing here
+    asserts its contents beyond the row count.
+    """
+
+    @responses.activate
+    def test_article_get_returns_fewer_than_requested(self, client):
+        responses.add(
+            responses.POST,
+            client._soap_url,
+            body=load_fixture("get_article_information_response.xml"),
+            status=200,
+            content_type="text/xml",
+        )
+        assert len(client.article_get(["NIK70036600", "ZZZDOESNOTEXIST999"])) == 1
+
+    @responses.activate
+    def test_price_get_returns_a_row_for_an_unknown_code(self, client):
+        responses.add(
+            responses.POST,
+            client._soap_url,
+            body=load_fixture("get_prices_unknown_code_response.xml"),
+            status=200,
+            content_type="text/xml",
+        )
+        prices = client.price_get([("NIK70036600", 1), ("ZZZDOESNOTEXIST999", 1)])
+        assert len(prices) == 2
 
 
 class TestErrorHandling:
@@ -304,6 +406,41 @@ class TestCatalogDownload:
         with pytest.raises(RexelConnectionError):
             client.catalog_download()
 
+    @responses.activate
+    def test_catalog_download_snapshot(self, client):
+        payload = load_fixture_bytes("rexstand_999999.zip")
+        responses.add(
+            responses.GET,
+            f"{client.base_url}/rs/prod/netstore/downloads/rexstand",
+            body=payload,
+            status=200,
+            content_type="application/octet-stream",
+        )
+        snapshot = client.catalog_download_snapshot()
+        assert isinstance(snapshot, CatalogSnapshot)
+        assert snapshot.raw == payload
+        assert snapshot.sha256 == hashlib.sha256(payload).hexdigest()
+        # The generation stamp is the ZIP entry's mtime — nowhere in the DBF itself.
+        assert snapshot.generated_at == datetime(2026, 7, 2, 15, 15, 44)
+        assert snapshot.catalog_date == snapshot.items[0].catalog_date
+        assert len(snapshot.items) == 3
+        assert snapshot.items[0].item_code == "ABBKIM600763W"
+
+    def test_snapshot_reads_the_zip_once(self):
+        # Same rows as the plain parse, so callers can switch without re-verifying.
+        payload = load_fixture_bytes("rexstand_999999.zip")
+        assert parse_catalog_snapshot(payload).items == parse_catalog_zip(payload)
+
+    def test_parse_catalog_snapshot_without_dbf_raises(self):
+        import io
+        import zipfile
+
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as z:
+            z.writestr("readme.txt", "no dbf here")
+        with pytest.raises(ValueError, match="no .dbf"):
+            parse_catalog_snapshot(buf.getvalue())
+
     def test_parse_catalog_zip_without_dbf_raises(self):
         import io
         import zipfile
@@ -355,3 +492,41 @@ class TestBasketGet:
         with pytest.raises(RexelConnectionError):
             client.basket_get_raw()
         assert len(responses.calls) == 1
+
+
+class TestWsdlContract:
+    """The vendored production WSDL is the authority on what the service offers.
+
+    Kept in-repo (public, 6.7 KB, unauthenticated) so the contract can be read and
+    asserted against without a network call — and so a future 'add an operation'
+    request meets the declaration first.
+    """
+
+    WSDL = "{http://schemas.xmlsoap.org/wsdl/}"
+
+    def _definitions(self):
+        return ET.fromstring((FIXTURES_DIR / "rexel_prod.wsdl").read_bytes())
+
+    def _declared_operations(self, definitions):
+        port_type = definitions.find(f"{self.WSDL}portType")
+        return {op.get("name") for op in port_type.findall(f"{self.WSDL}operation")}
+
+    def test_service_declares_exactly_three_operations(self):
+        declared = self._declared_operations(self._definitions())
+        assert declared == {"getArticleInformation", "getPrices", "getBasket"}
+
+    def test_built_envelopes_match_the_declared_operations(self):
+        definitions = self._definitions()
+        declared = self._declared_operations(definitions)
+        assert definitions.get("targetNamespace") == soap.SERVICE_NS
+
+        built = [
+            soap.build_get_article_information("c", "u", "p", "NL", ["X"]),
+            soap.build_get_prices("c", "u", "p", "NL", [("X", 1)]),
+            soap.build_get_basket("c", "u", "p", "NL"),
+        ]
+        for envelope in built:
+            operation = ET.fromstring(envelope).find(f"{{{soap.SOAP_ENV}}}Body")[0]
+            namespace, _, name = operation.tag.partition("}")
+            assert namespace.lstrip("{") == soap.SERVICE_NS
+            assert name in declared
