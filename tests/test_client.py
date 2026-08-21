@@ -3,12 +3,16 @@
 Fixtures under ``tests/fixtures`` are real captured responses from the production
 ``rexel`` service (no credentials in them), plus two hand-built error envelopes and a
 3-row DBF sliced from the real weekly catalog. ``rexel_prod.wsdl`` is the production
-WSDL verbatim (public, unauthenticated) and is the authority on the contract.
+WSDL verbatim (public, unauthenticated) as it stood on its retrieval date — see
+``tests/fixtures/PROVENANCE.md`` for its source URL and refresh recipe.
 """
 
 import hashlib
+import io
+import re
 import xml.etree.ElementTree as ET
-from datetime import datetime
+import zipfile
+from datetime import date, datetime
 from decimal import Decimal
 from pathlib import Path
 
@@ -38,6 +42,31 @@ def load_fixture(name: str) -> str:
 
 def load_fixture_bytes(name: str) -> bytes:
     return (FIXTURES_DIR / name).read_bytes()
+
+
+def emitted_item_codes(call) -> list[str]:
+    """The ``itemCodes`` actually put on the wire by a getArticleInformation call."""
+    operation = ET.fromstring(call.request.body).find(f"{{{soap.SOAP_ENV}}}Body")[0]
+    return [element.text for element in operation.findall("itemCodes")]
+
+
+def rexstand_zip_with_dates(*dates: str) -> bytes:
+    """The 3-row fixture ZIP, rewritten so its rows carry the given DATE values.
+
+    DBF fields are fixed width, so each 10-char ``YYYY/MM/DD`` is overwritten in place
+    (blanks padded with spaces) and every record offset survives untouched.
+    """
+    with zipfile.ZipFile(io.BytesIO(load_fixture_bytes("rexstand_999999.zip"))) as archive:
+        name = archive.namelist()[0]
+        dbf = bytearray(archive.read(name))
+    offsets = [m.start() for m in re.finditer(rb"\d{4}/\d{2}/\d{2}", bytes(dbf))]
+    assert len(offsets) == len(dates), "one replacement date per row required"
+    for offset, value in zip(offsets, dates):
+        dbf[offset : offset + 10] = value.ljust(10).encode()
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as out:
+        out.writestr(name, bytes(dbf))
+    return buf.getvalue()
 
 
 @pytest.fixture
@@ -145,9 +174,32 @@ class TestArticlesByCode:
             content_type="text/xml",
         )
         found = client.articles_by_code(["  nik70036600  "])
+        # The tolerance is ours, not the remote service's: the code goes out canonical.
+        assert emitted_item_codes(responses.calls[0]) == ["NIK70036600"]
         # Keyed by the requested string verbatim, so the caller can look it back up.
         assert list(found) == ["  nik70036600  "]
         assert found["  nik70036600  "].item_code == "NIK70036600"
+
+    @responses.activate
+    def test_codes_differing_only_in_case_are_asked_once_and_answered_twice(self, client):
+        responses.add(
+            responses.POST,
+            client._soap_url,
+            body=load_fixture("get_article_information_response.xml"),
+            status=200,
+            content_type="text/xml",
+        )
+        found = client.articles_by_code(["NIK70036600", "  nik70036600  "])
+        assert emitted_item_codes(responses.calls[0]) == ["NIK70036600"]
+        # Both spellings keep their own key; neither overwrites the other.
+        assert list(found) == ["NIK70036600", "  nik70036600  "]
+        assert found["NIK70036600"] is found["  nik70036600  "]
+
+    @responses.activate
+    def test_blank_codes_are_never_sent(self, client):
+        # No HTTP mock registered -> proves nothing goes on the wire for codes that
+        # cannot resolve to anything.
+        assert client.articles_by_code(["", "   "]) == {}
 
     @responses.activate
     def test_unknown_code_is_absent(self, client):
@@ -269,6 +321,8 @@ class TestUnknownCodeAsymmetry:
             content_type="text/xml",
         )
         prices = client.price_get([("NIK70036600", 1), ("ZZZDOESNOTEXIST999", 1)])
+        # Count only: the fixture's unknown row is hand-built, so this pins that the
+        # parser keeps a placeholder row and is *no* evidence about its field values.
         assert len(prices) == 2
 
 
@@ -431,10 +485,45 @@ class TestCatalogDownload:
         payload = load_fixture_bytes("rexstand_999999.zip")
         assert parse_catalog_snapshot(payload).items == parse_catalog_zip(payload)
 
-    def test_parse_catalog_snapshot_without_dbf_raises(self):
-        import io
-        import zipfile
+    def test_snapshot_date_is_none_when_no_row_carries_one(self):
+        snapshot = parse_catalog_snapshot(rexstand_zip_with_dates("", "", ""))
+        assert snapshot.catalog_date is None
+        assert len(snapshot.items) == 3
 
+    def test_snapshot_rejects_disagreeing_row_dates(self):
+        payload = rexstand_zip_with_dates("2026/07/01", "2026/07/08", "2026/07/01")
+        with pytest.raises(ValueError, match="inconsistent DATE"):
+            parse_catalog_snapshot(payload)
+        # The rows themselves still parse — only the one-date claim is refused.
+        assert {item.catalog_date for item in parse_catalog_zip(payload)} == {
+            date(2026, 7, 1),
+            date(2026, 7, 8),
+        }
+
+    def test_snapshot_rejects_a_mix_of_dated_and_blank_rows(self):
+        with pytest.raises(ValueError, match=r"inconsistent DATE.*\(missing\)"):
+            parse_catalog_snapshot(rexstand_zip_with_dates("2026/07/01", "", "2026/07/01"))
+
+    def test_parse_catalog_zip_rejects_more_than_one_dbf(self):
+        # Rexel ships exactly one DBF; picking among several would be arbitrary.
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as z:
+            z.writestr("a.dbf", b"first")
+            z.writestr("b.dbf", b"second")
+        for parse in (parse_catalog_zip, parse_catalog_snapshot):
+            with pytest.raises(ValueError, match="2 .dbf members"):
+                parse(buf.getvalue())
+
+    def test_parse_catalog_zip_rejects_a_duplicated_dbf_name(self):
+        # Two members under one name: zipfile would resolve the name to the last one.
+        buf = io.BytesIO()
+        with pytest.warns(UserWarning, match="Duplicate name"), zipfile.ZipFile(buf, "w") as z:
+            z.writestr("999999.dbf", b"first")
+            z.writestr("999999.dbf", b"second")
+        with pytest.raises(ValueError, match="2 .dbf members"):
+            parse_catalog_zip(buf.getvalue())
+
+    def test_parse_catalog_snapshot_without_dbf_raises(self):
         buf = io.BytesIO()
         with zipfile.ZipFile(buf, "w") as z:
             z.writestr("readme.txt", "no dbf here")
@@ -442,9 +531,6 @@ class TestCatalogDownload:
             parse_catalog_snapshot(buf.getvalue())
 
     def test_parse_catalog_zip_without_dbf_raises(self):
-        import io
-        import zipfile
-
         buf = io.BytesIO()
         with zipfile.ZipFile(buf, "w") as z:
             z.writestr("readme.txt", "no dbf here")
@@ -495,11 +581,13 @@ class TestBasketGet:
 
 
 class TestWsdlContract:
-    """The vendored production WSDL is the authority on what the service offers.
+    """The vendored production WSDL: what the service declared on its retrieval date.
 
     Kept in-repo (public, 6.7 KB, unauthenticated) so the contract can be read and
     asserted against without a network call — and so a future 'add an operation'
-    request meets the declaration first.
+    request meets the declaration first. It is a snapshot, not live authority: these
+    tests catch drift in our builders, not in Rexel's service. Source URL, retrieval
+    date and refresh recipe live in ``tests/fixtures/PROVENANCE.md``.
     """
 
     WSDL = "{http://schemas.xmlsoap.org/wsdl/}"

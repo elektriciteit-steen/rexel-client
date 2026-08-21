@@ -107,11 +107,34 @@ def _entry_mtime(info: zipfile.ZipInfo) -> datetime | None:
 
 
 def _dbf_entry(archive: zipfile.ZipFile) -> zipfile.ZipInfo:
-    """The single ``.dbf`` member of a rexstand ZIP."""
-    for info in archive.infolist():
-        if Path(info.filename).suffix.lower() == ".dbf":
-            return info
-    raise ValueError("rexstand ZIP contains no .dbf file")
+    """The single ``.dbf`` member of a rexstand ZIP.
+
+    A rexstand ZIP holds exactly one DBF. More than one — including the same name
+    stored twice — leaves no non-arbitrary choice, so it is refused rather than
+    silently picking one.
+    """
+    entries = [i for i in archive.infolist() if Path(i.filename).suffix.lower() == ".dbf"]
+    if not entries:
+        raise ValueError("rexstand ZIP contains no .dbf file")
+    if len(entries) > 1:
+        names = ", ".join(i.filename for i in entries)
+        raise ValueError(f"rexstand ZIP contains {len(entries)} .dbf members ({names}), expected 1")
+    return entries[0]
+
+
+def _uniform_catalog_date(items: list[CatalogItem]) -> date | None:
+    """The one ``DATE`` the rows agree on, or None when none of them carries one.
+
+    ``CatalogSnapshot.catalog_date`` is the assortment's price-validity date and is
+    used to decide refreshes and label archives. Rows that disagree — two dates, or
+    some dated and some blank — have no single such date, and answering with an
+    arbitrary one would be worse than refusing.
+    """
+    distinct = {item.catalog_date for item in items}
+    if len(distinct) > 1:
+        shown = ", ".join(sorted(d.isoformat() if d else "(missing)" for d in distinct))
+        raise ValueError(f"rexstand DBF has inconsistent DATE values: {shown}")
+    return next(iter(distinct), None)
 
 
 def parse_catalog_zip(zip_bytes: bytes) -> list[CatalogItem]:
@@ -119,6 +142,8 @@ def parse_catalog_zip(zip_bytes: bytes) -> list[CatalogItem]:
 
     Use :func:`parse_catalog_snapshot` when the download's identity (digest,
     generation stamp) matters too — it answers with all of it in one pass.
+
+    Raises ``ValueError`` unless the ZIP holds exactly one ``.dbf`` member.
     """
     with zipfile.ZipFile(io.BytesIO(zip_bytes)) as archive:
         dbf_bytes = archive.read(_dbf_entry(archive))
@@ -131,6 +156,9 @@ def parse_catalog_snapshot(zip_bytes: bytes) -> CatalogSnapshot:
     The generation stamp lives on the ZIP entry, not in the DBF, so it is only
     recoverable while the archive is open — reading it afterwards means unzipping
     the same bytes twice. This does both in one pass.
+
+    Raises ``ValueError`` unless the ZIP holds exactly one ``.dbf`` member and its
+    rows agree on a single ``DATE``.
     """
     with zipfile.ZipFile(io.BytesIO(zip_bytes)) as archive:
         entry = _dbf_entry(archive)
@@ -140,6 +168,6 @@ def parse_catalog_snapshot(zip_bytes: bytes) -> CatalogSnapshot:
         raw=zip_bytes,
         sha256=hashlib.sha256(zip_bytes).hexdigest(),
         generated_at=generated_at,
-        catalog_date=next((item.catalog_date for item in items if item.catalog_date), None),
+        catalog_date=_uniform_catalog_date(items),
         items=items,
     )
