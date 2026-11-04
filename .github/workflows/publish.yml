@@ -3,6 +3,7 @@
 # GitHub-hosted exemption: stays on ubuntu-latest (NOT the self-hosted ci pool)
 # because PyPI OIDC trusted publishing is cleanest/most secure from GitHub-hosted
 # runners with the ambient id-token; the self-hosted pool is not a trusted publisher.
+# Canon: bess-documentation/infrastructure/self-hosted-runner-ci-patterns.md
 name: Publish to PyPI
 
 on:

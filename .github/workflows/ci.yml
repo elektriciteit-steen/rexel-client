@@ -4,6 +4,7 @@
 # publish.yml needs a GitHub-hosted runner for PyPI OIDC trusted publishing anyway,
 # so keeping both workflows on ubuntu-latest avoids standing up self-hosted plumbing
 # for zero gain.
+# Canon: bess-documentation/infrastructure/self-hosted-runner-ci-patterns.md
 name: CI
 
 on:
