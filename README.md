@@ -2,8 +2,7 @@
 
 Python client for the **Rexel Belgium** web services - the transport layer for the
 `connector_rexel` Odoo addon. It wraps the two Rexel data sources behind one stable
-surface so that the coming Rexel Group-wide API (expected ~2027) can be swapped in here
-without touching Odoo.
+surface.
 
 - **SOAP** `getArticleInformation`, `getPrices`, `getBasket` on
   `https://services.rexel.be/exchange/ws/prod/rexel` (Apache CXF, document/literal).
@@ -36,13 +35,29 @@ articles = client.article_get(["NIK70036600"])
 by_code = client.articles_by_code(["NIK70036600", "E2222407"])
 
 # Live prices + levies + availability for (item_code, quantity) pairs — auto-batched ≤100
-prices = client.price_get([("NIK70036600", 1)])
+prices = client.price_get([("LEG310084", 2)])
+prices[0].net_price       # line total for the quantity asked
+prices[0].unit_net_price  # net_price / 2, likewise unit_ecotax, unit_recupel, …
 
 # Weekly bulk catalog: the agreed customer assortment with net prices + Belgian levies
 items = client.catalog_download()               # -> list[CatalogItem]
 raw_zip = client.catalog_download_raw()          # -> bytes, for archival
 snapshot = client.catalog_download_snapshot()    # -> raw + sha256 + generated_at + items
 ```
+
+### Price amounts are line totals
+
+`getPrices` answers `NetPrice`, `TotalSurcharge`, `Ecotax`, `Recupel` and `Sabam` as line
+totals for the requested quantity; only `BasePrice` is per unit. `Price` keeps those raw
+totals and adds `quantity` plus `unit_net_price`, `unit_ecotax`, `unit_recupel`,
+`unit_sabam` and `unit_total_surcharge`, not rounded to a money scale, so no caller divides
+by hand. SOAP rounds levies to 2 decimals per unit before totalling them, so `unit_ecotax`
+can differ from the invoice's 4-decimal tariff.
+
+Rows pair with quantities by position. Rexel answers one row per requested line in order,
+and a reply that does not raises `RexelAPIError`. The service prices whole quantities: a
+fractional quantity is truncated, and one below 1 raises `ValueError` before any call
+(Rexel would answer quantity 0 with the amounts for 1).
 
 ### Unknown codes: the two calls disagree
 
@@ -59,11 +74,11 @@ not rest on the remote service normalising them. Codes differing only in case or
 are asked once and answered twice — each keeps its own key, holding the same `Article`.
 The manufacturer reference is not resolvable: the service returns nothing for it.
 
-### ⚠️ `getBasket` is destructive
+### `getBasket` is one-shot
 
-Reading the NetStore basket **empties it** on the server. The client never retries it and
+Call it only when you mean to, and keep what it returns. The client never retries it and
 returns the raw `<Content>` XML string (`basket_get_raw()`) so callers can persist it
-before parsing. Structured basket modelling lands in Phase 4.
+before parsing.
 
 ## Design notes
 

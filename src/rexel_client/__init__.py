@@ -12,7 +12,6 @@ from .models import Article, CatalogItem, CatalogSnapshot, Price
 
 try:
     # Single source of truth for the version: the installed package metadata.
-    # (cebeo-client hard-coded __version__ and drifted from pyproject — don't repeat that.)
     __version__ = version("rexel-client")
 except PackageNotFoundError:  # pragma: no cover - only when running from a bare checkout
     __version__ = "0.0.0"

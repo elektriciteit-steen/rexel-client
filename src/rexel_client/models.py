@@ -44,6 +44,11 @@ class Price:
 
     ``Available`` comes back as a decimal quantity string (e.g. ``"9577.000"``);
     it is normalised to ``available_qty`` (int) plus an ``available`` bool.
+
+    NetPrice, TotalSurcharge, Ecotax, Recupel and Sabam are **line totals** for
+    ``quantity``; the ``unit_*`` properties give them per unit, not rounded to a money
+    scale (plain ``Decimal`` division). Only ``base_price`` is already per unit. SOAP
+    rounds levies to 2 decimals per unit, so a unit levy can differ from the invoice's.
     """
 
     item_code: str
@@ -51,9 +56,9 @@ class Price:
     ean: str
     description: str
     sales_unit_code: str
-    base_price: Decimal  # BasePrice (gross/list)
-    net_price: Decimal  # NetPrice (customer net)
-    total_surcharge: Decimal  # sum of the levies below
+    base_price: Decimal  # BasePrice (gross/list), per unit
+    net_price: Decimal  # NetPrice (customer net), line total
+    total_surcharge: Decimal  # sum of the levies below, line total
     ecotax: Decimal
     recupel: Decimal
     sabam: Decimal
@@ -62,6 +67,27 @@ class Price:
     available: bool
     available_qty: int | None
     lead_time_days: int | None
+    quantity: int = 1  # the quantity these line totals were requested for
+
+    @property
+    def unit_net_price(self) -> Decimal:
+        return self.net_price / self.quantity
+
+    @property
+    def unit_ecotax(self) -> Decimal:
+        return self.ecotax / self.quantity
+
+    @property
+    def unit_recupel(self) -> Decimal:
+        return self.recupel / self.quantity
+
+    @property
+    def unit_sabam(self) -> Decimal:
+        return self.sabam / self.quantity
+
+    @property
+    def unit_total_surcharge(self) -> Decimal:
+        return self.total_surcharge / self.quantity
 
 
 @dataclass

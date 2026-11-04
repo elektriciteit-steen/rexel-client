@@ -3,8 +3,7 @@
 # is a tiny pure-Python library with no private build deps, and the sibling
 # publish.yml needs a GitHub-hosted runner for PyPI OIDC trusted publishing anyway,
 # so keeping both workflows on ubuntu-latest avoids standing up self-hosted plumbing
-# for zero gain. (rexel-client is a PRIVATE repo, so the public-repo self-hosted
-# restriction that applies to cebeo-client does not apply here.)
+# for zero gain.
 # Canon: bess-documentation/infrastructure/self-hosted-runner-ci-patterns.md
 name: CI
 

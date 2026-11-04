@@ -6,10 +6,11 @@ One class, :class:`RexelClient`, over the two Rexel data sources:
   ``…/exchange/ws/prod/rexel`` (auto-batched at ≤100 per call).
 * **REST** ``rexstand`` bulk catalog on ``…/exchange/rs/prod/netstore/downloads``.
 
-This is the one place that knows the Rexel protocol. When the Rexel Group-wide API
-lands (~2027), the transport swap happens here, behind this same public surface.
+This is the one place that knows the Rexel protocol.
 """
 
+import logging
+import re
 import xml.etree.ElementTree as ET
 from contextlib import contextmanager
 from decimal import Decimal
@@ -20,7 +21,7 @@ from urllib3.util.retry import Retry
 
 from . import soap
 from .catalog import parse_catalog_snapshot, parse_catalog_zip
-from .exceptions import RexelConnectionError
+from .exceptions import RexelAPIError, RexelConnectionError
 from .models import Article, CatalogItem, CatalogSnapshot, Price
 
 DEFAULT_BASE_URL = "https://services.rexel.be/exchange"
@@ -36,17 +37,44 @@ def _canonical(code: str | None) -> str:
     return (code or "").strip().upper()
 
 
+def _without_query(message: object) -> str:
+    """``message`` with any URL query string cut: rexstand's holds the credentials."""
+    return re.sub(r"\?\S*", "", str(message))
+
+
+class _HideRexstandQuery(logging.Filter):
+    """Keep the credentials out of the request URLs urllib3 logs for rexstand."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if isinstance(record.args, tuple):
+            record.args = tuple(
+                _without_query(arg) if isinstance(arg, str) and REXSTAND_PATH in arg else arg
+                for arg in record.args
+            )
+        return True
+
+
+for _logger_name in ("urllib3.connectionpool", "urllib3.util.retry"):
+    logging.getLogger(_logger_name).addFilter(_HideRexstandQuery())
+
+
 @contextmanager
 def _transport_errors():
-    """Map requests transport failures to RexelConnectionError (single source of truth)."""
+    """Map requests failures to RexelConnectionError (single source of truth).
+
+    ``from None`` matters: the original exception's text holds the URL, and with it the
+    rexstand credentials.
+    """
     try:
         yield
     except requests.exceptions.Timeout as exc:
-        raise RexelConnectionError(f"Request timed out: {exc}") from exc
+        raise RexelConnectionError(f"Request timed out: {_without_query(exc)}") from None
     except requests.exceptions.ConnectionError as exc:
-        raise RexelConnectionError(f"Connection failed: {exc}") from exc
+        raise RexelConnectionError(f"Connection failed: {_without_query(exc)}") from None
     except requests.exceptions.HTTPError as exc:
-        raise RexelConnectionError(f"HTTP error: {exc}") from exc
+        raise RexelConnectionError(f"HTTP error: {_without_query(exc)}") from None
+    except requests.exceptions.RequestException as exc:  # e.g. RetryError after repeated 503s
+        raise RexelConnectionError(f"Request failed: {_without_query(exc)}") from None
 
 
 class RexelClient:
@@ -81,7 +109,7 @@ class RexelClient:
         self.batch_size = min(batch_size, MAX_BATCH)
 
         # Shared session with a retry adapter for idempotent reads (SOAP article/price,
-        # rexstand GET). getBasket is destructive and NEVER retried — it uses a bare POST.
+        # rexstand GET). getBasket is NEVER retried — it uses a bare POST.
         self._session = requests.Session()
         retry = Retry(
             total=3,
@@ -189,31 +217,43 @@ class RexelClient:
         """Fetch live prices for (item_code, quantity) pairs. Auto-batches at ≤100.
 
         An unknown code still gets a **row** here (zero prices, no availability) rather
-        than being dropped, so the result normally lines up one-to-one with ``items``.
-        This is the opposite of :meth:`article_get`, which drops unknown codes — do not
-        infer existence from a price row, and do not assume either call returns as many
-        entries as it was given.
+        than being dropped, so the result lines up one-to-one with ``items``, in order; a
+        reply that does not raises :class:`RexelAPIError`. This is the opposite of
+        :meth:`article_get`, which drops unknown codes — do not infer existence from a
+        price row.
+
+        Each row's amounts are line totals for its ``quantity``; see :class:`Price` for
+        the per-unit ones. The service prices whole quantities, so a fractional quantity
+        is truncated. A quantity below 1 raises ``ValueError``: Rexel would answer it
+        with the amounts for 1.
         """
-        if not items:
-            return []
+        for code, qty in items:
+            if qty < 1:
+                raise ValueError(f"Quantity for {code} must be at least 1, got {qty}")
+        whole = [(code, int(qty)) for code, qty in items]
         prices: list[Price] = []
-        for start in range(0, len(items), self.batch_size):
-            batch = [(code, int(qty)) for code, qty in items[start : start + self.batch_size]]
+        for start in range(0, len(whole), self.batch_size):
+            batch = whole[start : start + self.batch_size]
             body = soap.build_get_prices(
                 self.customer_number, self.username, self.password, self.language, batch
             )
-            prices.extend(soap.parse_prices(self._post_soap(body)))
+            rows = soap.parse_prices(self._post_soap(body))
+            if len(rows) != len(batch):
+                raise RexelAPIError(-1, f"getPrices: {len(rows)} rows for {len(batch)} items")
+            # By position: an e-number comes back under its Rexel ref, an unknown code under
+            # no code at all, and one code can be asked twice at two quantities.
+            for price, (_, qty) in zip(rows, batch):
+                price.quantity = qty
+            prices.extend(rows)
         return prices
 
-    # --- SOAP getBasket (⚠️ destructive) -----------------------------------------------
+    # --- SOAP getBasket (one-shot) ------------------------------------------------------
 
     def basket_get_raw(self) -> str | None:
         """Fetch the NetStore basket and return the raw inner ``<Content>`` XML string.
 
-        ⚠️ **Destructive**: reading the basket empties it in NetStore. This call is
-        never retried. Structured ``Basket``/``BasketLine`` modelling is deferred to
-        Phase 4 (needs a captured real response first); until then callers get the raw
-        XML so they can persist-before-parse (the Phase 4 crash-safety requirement).
+        **One-shot**: call it only when you mean to, and keep what it returns. It is never
+        retried. Callers get the raw XML so they can persist it before parsing.
 
         Returns the ``<Content>`` XML string, or ``None`` if the basket is empty.
         """
@@ -249,7 +289,7 @@ class RexelClient:
         """Download the ``rexstand`` ZIP and return the raw bytes (for archival).
 
         The sync job archives this verbatim as an attachment so every DBF column is
-        preserved week-by-week (plan OQ5). Parsing is separate — see
+        preserved week-by-week. Parsing is separate — see
         :meth:`catalog_download`.
         """
         with _transport_errors():
