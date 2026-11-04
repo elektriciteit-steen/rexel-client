@@ -8,8 +8,13 @@ WSDL verbatim (public, unauthenticated) as it stood on its retrieval date — se
 """
 
 import hashlib
+import http.server
 import io
+import logging
 import re
+import socket
+import threading
+import traceback
 import xml.etree.ElementTree as ET
 import zipfile
 from datetime import date, datetime
@@ -280,7 +285,114 @@ class TestPriceGet:
 
     @responses.activate
     def test_price_get_batches(self):
-        c = RexelClient("123456", "u", "p", batch_size=50)
+        c = RexelClient("123456", "u", "p", batch_size=2)
+        responses.add(
+            responses.POST,
+            c._soap_url,
+            body=load_fixture("get_prices_response.xml"),  # two rows, one batch's worth
+            status=200,
+            content_type="text/xml",
+        )
+        assert len(c.price_get([(f"CODE{i}", i + 1) for i in range(6)])) == 6
+        assert len(responses.calls) == 3  # 6 / 2
+
+
+class TestPriceQuantities:
+    """getPrices amounts are line totals for the requested quantity; Price says per unit.
+
+    ``get_prices_quantities_response.xml`` is one recorded call with made-up amounts; see
+    ``PROVENANCE.md``. ``LEG310084`` x2 and ``NIK76136605`` x10 are vendor-bill rows.
+    """
+
+    REQUESTED = [
+        ("NIK76136605", 10),
+        ("ZZZDOESNOTEXIST999", 3),
+        ("E2222407", 4),
+        ("LEG310084", 2),
+        ("NIK76136605", 1),
+    ]
+
+    @pytest.fixture
+    def recorded(self):
+        with responses.RequestsMock() as mock:
+            mock.add(
+                responses.POST,
+                "https://services.rexel.be/exchange/ws/prod/rexel",
+                body=load_fixture("get_prices_quantities_response.xml"),
+                status=200,
+                content_type="text/xml",
+            )
+            yield mock
+
+    def test_each_row_carries_the_quantity_requested_for_its_position(self, client, recorded):
+        prices = client.price_get(self.REQUESTED)
+        # By position, not code: Rexel answers an e-number under its Rexel ref, an unknown
+        # code under no code at all, and one code can be asked twice at two quantities.
+        assert [(p.item_code, p.quantity) for p in prices] == [
+            ("NIK76136605", 10),
+            ("", 3),
+            ("NIK70036600", 4),
+            ("LEG310084", 2),
+            ("NIK76136605", 1),
+        ]
+
+    def test_unit_amounts_are_the_line_totals_per_unit(self, client, recorded):
+        prices = client.price_get(self.REQUESTED)
+
+        leg = prices[3]  # x2
+        assert leg.unit_net_price == Decimal("100")
+        assert leg.unit_ecotax == Decimal("0.20")
+        assert leg.unit_recupel == Decimal("0.10")
+        assert leg.unit_sabam == Decimal("0.05")
+        assert leg.unit_total_surcharge == Decimal("0.35")
+
+        nik = prices[0]  # x10
+        assert nik.unit_net_price == Decimal("5")
+        assert nik.unit_ecotax == Decimal("0")
+        assert nik.unit_recupel == Decimal("0.03")
+        assert nik.unit_sabam == Decimal("0")
+        assert nik.unit_total_surcharge == Decimal("0.03")
+
+    def test_raw_totals_and_base_price_stay_as_answered(self, client, recorded):
+        leg = client.price_get(self.REQUESTED)[3]
+        assert leg.net_price == Decimal("200.0000")
+        assert leg.ecotax == Decimal("0.4000")
+        assert leg.recupel == Decimal("0.2000")
+        assert leg.sabam == Decimal("0.1000")
+        assert leg.total_surcharge == Decimal("0.7000")
+        # BasePrice is the one per-unit amount Rexel sends: never divided.
+        assert leg.base_price == Decimal("150.0000")
+
+    def test_a_reply_with_the_wrong_row_count_is_refused(self, client, recorded):
+        # Rows pair with quantities by position only, so a missing row would silently
+        # divide every row after it by the wrong quantity.
+        with pytest.raises(RexelAPIError, match="5 rows for 4"):
+            client.price_get(self.REQUESTED[:4])
+
+    @responses.activate
+    @pytest.mark.parametrize("quantity", [0, -1, Decimal("0.5")])
+    def test_a_quantity_below_one_is_refused_before_any_call(self, client, quantity):
+        # Rexel answers quantity 0 with the amounts for 1 (verified live), so these totals
+        # would not be for the quantity asked. No HTTP mock registered -> proves no request.
+        with pytest.raises(ValueError, match=f"NIK76136605.*got {quantity}"):
+            client.price_get([("NIK70036600", 1), ("NIK76136605", quantity)])
+
+    @responses.activate
+    def test_quantity_is_the_whole_number_that_went_on_the_wire(self, client):
+        # The service prices whole quantities, so that is what the totals are for.
+        responses.add(
+            responses.POST,
+            client._soap_url,
+            body=load_fixture("get_prices_response.xml"),
+            status=200,
+            content_type="text/xml",
+        )
+        prices = client.price_get([("NIK70036600", Decimal("1.9")), ("LEG010424", Decimal("5"))])
+        assert [p.quantity for p in prices] == [1, 5]
+
+    @responses.activate
+    def test_quantities_stay_with_their_rows_across_batches(self):
+        c = RexelClient("123456", "u", "p", batch_size=2)
         responses.add(
             responses.POST,
             c._soap_url,
@@ -288,8 +400,8 @@ class TestPriceGet:
             status=200,
             content_type="text/xml",
         )
-        c.price_get([(f"CODE{i}", 1) for i in range(101)])
-        assert len(responses.calls) == 3  # 101 -> 50 + 50 + 1
+        prices = c.price_get([(f"CODE{i}", i + 1) for i in range(4)])
+        assert [p.quantity for p in prices] == [1, 2, 3, 4]
 
 
 class TestUnknownCodeAsymmetry:
@@ -538,8 +650,70 @@ class TestCatalogDownload:
             parse_catalog_zip(buf.getvalue())
 
 
+class TestCredentialsStayOutOfErrors:
+    """rexstand takes its credentials in the query string, so its URL must never surface.
+
+    Runs the real requests/urllib3 stack against localhost, since it is their messages and
+    log lines that carry the URL. A mock would only prove what the mock was told to say.
+    """
+
+    SECRETS = ("CUSTSECRET", "USERSECRET", "PASSSECRET")
+
+    @pytest.fixture
+    def rexstand_answering(self):
+        servers = []
+
+        def start(status):
+            class Handler(http.server.BaseHTTPRequestHandler):
+                def do_GET(self):
+                    self.send_response(status)
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+
+                def log_message(self, *args):
+                    pass
+
+            server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+            threading.Thread(target=server.serve_forever, daemon=True).start()
+            servers.append(server)
+            return f"http://127.0.0.1:{server.server_port}"
+
+        yield start
+        for server in servers:
+            server.shutdown()
+            server.server_close()
+
+    def assert_no_secret_in(self, text):
+        assert not [secret for secret in self.SECRETS if secret in text]
+
+    @pytest.mark.parametrize("status", [401, 503])
+    def test_http_failures_do_not_carry_them(self, rexstand_answering, monkeypatch, caplog, status):
+        self.assert_failure_is_clean(rexstand_answering(status), monkeypatch, caplog)
+
+    def test_connection_failures_do_not_carry_them(self, monkeypatch, caplog):
+        with socket.socket() as closed:
+            closed.bind(("127.0.0.1", 0))
+            port = closed.getsockname()[1]
+        self.assert_failure_is_clean(f"http://127.0.0.1:{port}", monkeypatch, caplog)
+        # urllib3 logged its retries, and those lines are clean too.
+        assert "Retrying" in caplog.text
+
+    def assert_failure_is_clean(self, base_url, monkeypatch, caplog):
+        monkeypatch.setattr("time.sleep", lambda _seconds: None)  # urllib3's retry backoff
+        caplog.set_level(logging.DEBUG, logger="urllib3")
+        client = RexelClient(*self.SECRETS, base_url=base_url, timeout=2)
+        with pytest.raises(RexelConnectionError) as exc:
+            client.catalog_download_raw()
+        self.assert_no_secret_in(str(exc.value))
+        # What a logger.exception() would print, chained causes included.
+        self.assert_no_secret_in("".join(traceback.format_exception(exc.value)))
+        self.assert_no_secret_in(caplog.text)
+        # Still says what went wrong.
+        assert "/rexstand" in str(exc.value)
+
+
 class TestBasketGet:
-    """getBasket is destructive: verify raw passthrough, empty handling, no retry."""
+    """getBasket is one-shot: verify raw passthrough, empty handling, no retry."""
 
     @responses.activate
     def test_basket_get_raw_returns_content_xml(self, client):
@@ -551,7 +725,7 @@ class TestBasketGet:
             content_type="text/xml",
         )
         raw = client.basket_get_raw()
-        # Raw <Content> passed through verbatim for persist-before-parse (Phase 4).
+        # Raw <Content> passed through verbatim for persist-before-parse.
         assert raw is not None
         assert "<OrderLine>" in raw
         assert "NIK70036600" in raw

@@ -135,7 +135,7 @@ def build_get_prices(
 
 
 def build_get_basket(customer: str, user: str, password: str, language: str) -> bytes:
-    """Build a ``getBasket`` request. ⚠️ Destructive on the server (consumes the basket)."""
+    """Build a ``getBasket`` request. One-shot: see ``RexelClient.basket_get_raw``."""
     root, op = _envelope("getBasket")
     _auth(op, customer, user, password, language)
     return _serialize(root)
@@ -210,8 +210,7 @@ def content_to_string(content: ET.Element) -> str:
 
 # --- domain mapping (SOAP XML -> models) ----------------------------------------------
 # Kept here so soap.py owns the full SOAP contract: envelope build, status unwrap, and
-# the ArticleDetail/PriceDetail tag mapping all live together. The transport swap
-# (~2027 Group API) replaces this file without touching RexelClient's public surface.
+# the ArticleDetail/PriceDetail tag mapping all live together.
 
 
 def parse_articles(content: ET.Element) -> list[Article]:
